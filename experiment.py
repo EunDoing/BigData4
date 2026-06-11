@@ -1,7 +1,7 @@
 """
 MovieLens 1M 스트리밍 알고리즘 실험
 - Bloom Filter + Count-Min Sketch
-- 스트림 1회 통과로 모든 파라미터 동시 실험
+- 스트림 1회 통과로 모든 파라미터 동시 실험 및 정확한 FPR/오차 측정
 """
 
 import mmh3
@@ -16,7 +16,8 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 
-DATA_PATH = "/home/claude/ml-1m/ratings.dat"
+# [수정] 특정 계정명이 들어간 절대 경로를 지우고 범용적인 상대 경로로 변경
+DATA_PATH = "ml-1m/ratings.dat"
 
 class BloomFilter:
     def __init__(self, m, k):
@@ -25,7 +26,7 @@ class BloomFilter:
         self.bits = bytearray(math.ceil(m / 8))
         self.fp = 0
         self.fn = 0
-        self.queries = 0
+        self.queries = 0  # True Negative가 기대되는 상황(새로운 데이터)에서의 쿼리 횟수
 
     def _hashes(self, item):
         b = str(item).encode()
@@ -97,25 +98,36 @@ tracemalloc.start()
 t_start = time.time()
 total = 0
 
-for user_id, movie_id in stream_ratings(DATA_PATH):
-    already_seen = user_id in seen_users_exact
+try:
+    for user_id, movie_id in stream_ratings(DATA_PATH):
+        already_seen = user_id in seen_users_exact
 
-    for bf in bfs:
-        bf_says_seen = user_id in bf
-        if bf_says_seen and not already_seen:
-            bf.fp += 1
-        if not bf_says_seen and already_seen:
-            bf.fn += 1
-        bf.queries += 1
-        bf.add(user_id)
+        for bf in bfs:
+            bf_says_seen = user_id in bf
+            
+            # 실제 정답이 False일 때(처음 나타난 유저일 때)만 FPR 평가 세션으로 집계
+            if not already_seen:
+                bf.queries += 1
+                if bf_says_seen:
+                    bf.fp += 1
+            else:
+                # Bloom Filter는 구조상 False Negative가 발생할 수 없음
+                if not bf_says_seen:
+                    bf.fn += 1
+                    
+            bf.add(user_id)
 
-    for cms in cmss:
-        cms.add(movie_id)
+        for cms in cmss:
+            cms.add(movie_id)
 
-    if not already_seen:
-        seen_users_exact.add(user_id)
-    movie_count_exact[movie_id] += 1
-    total += 1
+        if not already_seen:
+            seen_users_exact.add(user_id)
+        movie_count_exact[movie_id] += 1
+        total += 1
+except FileNotFoundError:
+    print(f"\n[오류] 지정한 경로에 MovieLens 데이터가 없습니다: {DATA_PATH}")
+    print("스크립트와 같은 위치에 'ml-1m' 폴더를 두거나 DATA_PATH 상수를 수정해주세요.")
+    sys.exit(1)
 
 t_end = time.time()
 _, peak_mem = tracemalloc.get_traced_memory()
@@ -125,12 +137,17 @@ elapsed = t_end - t_start
 print(f"완료: {total:,}건, {elapsed:.2f}s, throughput={total/elapsed:,.0f}/s")
 print(f"고유 사용자: {len(seen_users_exact)}, 고유 영화: {len(movie_count_exact)}")
 
-# ── CMS 오차 계산 ──
+# ── CMS 오차 계산 (NumPy 벡터화로 속도 향상) ──
 movie_ids = list(movie_count_exact.keys())
+exact_counts = np.array([movie_count_exact[mid] for mid in movie_ids])
+
 cms_stats = []
 for cms in cmss:
-    errors = [abs(cms.query(mid) - movie_count_exact[mid]) for mid in movie_ids]
-    rel_errors = [abs(cms.query(mid) - movie_count_exact[mid]) / movie_count_exact[mid] for mid in movie_ids]
+    cms_counts = np.array([cms.query(mid) for mid in movie_ids])
+    
+    errors = np.abs(cms_counts - exact_counts)
+    rel_errors = errors / exact_counts
+    
     cms_stats.append({
         "w": cms.w, "d": cms.d,
         "mean_rel_error": float(np.mean(rel_errors)),
@@ -141,9 +158,10 @@ for cms in cmss:
 
 bf_stats = []
 for bf in bfs:
+    fpr = bf.fp / bf.queries if bf.queries > 0 else 0.0
     bf_stats.append({
         "m": bf.m, "k": bf.k,
-        "fpr": bf.fp / bf.queries,
+        "fpr": fpr,
         "fn": bf.fn,
         "memory_kb": bf.memory_bytes() / 1024,
     })
@@ -154,11 +172,11 @@ for s in bf_stats:
 
 print("\n── Count-Min Sketch 결과 ──")
 for s in cms_stats:
-    print(f"w={s['w']:>6,}, d={s['d']}: mean_rel_err={s['mean_rel_error']:.6f}, mem={s['memory_kb']:.1f}KB")
+    print(f"w={s['w']:>6,}, d={s['d']}: mean_rel_err={s['mean_rel_error']:.6f}, max_abs_err={s['max_abs_error']:.0f}, mem={s['memory_kb']:.1f}KB")
 
-# ── 그래프 ──
+# ── 그래프 시각화 ──
 fig, axes = plt.subplots(2, 3, figsize=(16, 10))
-fig.suptitle("Streaming Algorithm Experiment - MovieLens 1M (1,000,209 ratings)", fontsize=13)
+fig.suptitle("Streaming Algorithm Experiment - MovieLens 1M (1,000,209 ratings)", fontsize=14, y=0.98)
 
 # BF: FPR
 ax = axes[0][0]
@@ -228,15 +246,16 @@ ax.set_xlabel("Memory (KB)")
 ax.set_ylabel("Mean Relative Error")
 ax.grid(True, alpha=0.3)
 
-plt.tight_layout()
-plt.savefig("/home/claude/results.png", dpi=150, bbox_inches='tight')
+# 상단 대형 타이틀과 그래프 서브플롯 제목들이 겹치지 않게 가로세로 정돈
+plt.tight_layout(rect=[0, 0, 1, 0.95])
+plt.savefig("results.png", dpi=150, bbox_inches='tight')
 
 # 결과 저장
 results = {
     "summary": {
         "total_ratings": total,
         "elapsed_sec": elapsed,
-        "throughput_per_sec": total / elapsed,
+        "throughput_per_sec": total / elapsed if elapsed > 0 else 0,
         "peak_memory_mb": peak_mem / 1024 / 1024,
         "unique_users": len(seen_users_exact),
         "unique_movies": len(movie_count_exact),
@@ -244,7 +263,7 @@ results = {
     "bloom_filter": bf_stats,
     "count_min_sketch": cms_stats,
 }
-with open("/home/claude/results.json", "w") as f:
+with open("results.json", "w") as f:
     json.dump(results, f, indent=2)
 
 print("\n완료: results.png, results.json")
